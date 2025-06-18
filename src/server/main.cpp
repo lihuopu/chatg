@@ -2,6 +2,7 @@
 #include "chatservice.hpp"
 #include <signal.h>
 #include <iostream>
+#include "sqlconnpool.h"
 using namespace std;
 
 // 处理服务器ctrl+c 结束后，重置user的状态信息
@@ -18,6 +19,14 @@ int main(int argc, char **argv)
         exit(-1);
     }
 
+     string sql_host = "127.0.0.1";
+     int sql_port = 3306;
+     string sql_user = "root";
+     string sql_password = "kang0904";
+     string sql_dbname = "chat";
+     int sql_connSize = 10;
+
+    SqlConnPool::Instance()->Init(sql_host.c_str(),sql_port,sql_user.c_str(),sql_password.c_str(),sql_dbname.c_str(),sql_connSize);
     // 解析通过命令行参数传递的ip和port
     //eg:./ChatServer 127.0.0.1 6000
     char *ip = argv[1];

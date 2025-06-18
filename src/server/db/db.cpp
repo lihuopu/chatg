@@ -3,30 +3,31 @@
 
 // 数据库配置信息
 
-static string server = "127.0.0.1";
-static string user = "root";
-static string password = "kang0904";
-static string dbname = "chat";
+// static string server = "127.0.0.1";
+// static string user = "root";
+// static string password = "kang0904";
+// static string dbname = "chat";
  // 初始化数据库连接
  MySQL::MySQL()
  {
-     _conn = mysql_init(nullptr);
+    //conn = mysql_init(nullptr);
  }
 
  // 释放数据库连接资源
  MySQL::~MySQL()
  {
-     if (_conn != nullptr)
-     {
-         mysql_close(_conn);
-     }
+    //  if (_conn != nullptr)
+    //  {
+    //      mysql_close(_conn);
+    //  }
  }
  // 连接数据库
- bool MySQL::connect()
- {
-     MYSQL *p = mysql_real_connect(_conn, server.c_str(), user.c_str(),
-                                   password.c_str(), dbname.c_str(), 3306, nullptr, 0);//初始化的 MYSQL 对象指针、服务器地址、用户名、密码、数据库名、端口号、参数 unix_socket、client_flag
-     if (p != nullptr)
+ bool MySQL::connect(MYSQL*m_sql){
+     _conn = m_sql;
+    //  MYSQL *p = mysql_real_connect(_conn, server.c_str(), user.c_str(),
+    //              password.c_str(), dbname.c_str(), 3306, nullptr, 0);
+                 //初始化的 MYSQL 对象指针、服务器地址、用户名、密码、数据库名、端口号、参数 unix_socket、client_flag
+     if (_conn= nullptr)
      {
          //c和c++代码默认为ASCII，如不设置，MySQL上拉下来的中文显示为？
          mysql_query(_conn, "set names gbk");
@@ -34,9 +35,11 @@ static string dbname = "chat";
      }
     else{
         LOG_INFO<<"connect mysql fail!";
+        return false;
     }
-     return p;
+     return true;
  }
+
  // 更新操作
  bool MySQL::update(string sql)
  {

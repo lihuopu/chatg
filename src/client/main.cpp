@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <chrono>
 #include <ctime>
+#include <functional>
 using namespace std;
 using json = nlohmann::json;
 
@@ -16,10 +17,10 @@ using json = nlohmann::json;
 #include <arpa/inet.h>
 #include <semaphore.h>
 #include <atomic>
-
 #include "group.hpp"
 #include "user.hpp"
 #include "public.hpp"
+#include "clientssl.h"
 
 // 记录当前系统登录的用户信息
 User g_currentUser;
@@ -36,13 +37,15 @@ sem_t rwsem;
 // 记录登录状态
 atomic_bool g_isLoginSuccess{false};
 // 接收线程
-void readTaskHandler(int clientfd);
+void readTaskHandler(SSL *ssl);
 // 获取系统时间(聊天信息需要添加时间信息)
 string getCurrentTime();
 // 主聊天页面程序
-void mainMenu(int clientfd);
+void mainMenu(SSL*);
 // 显示当前登录成功用户的基本信息
 void showCurrentUserData();
+
+int clientfd;
 
 // 聊天客户端程序实现，main线程用作发送线程，子线程用作接收线程
 int main(int argc, char **argv)
@@ -61,6 +64,7 @@ int main(int argc, char **argv)
     //函数原型：int socket(int domain, int type, int protocol);
     // domain - 套接字使用的协议族 type - 套接字类型 protocol - 具体使用协议
     int clientfd = socket(AF_INET, SOCK_STREAM, 0);
+    SSL *ssl = nullptr;
     //检查套接字创建是否成功
     if (-1 == clientfd)
     {
@@ -88,10 +92,25 @@ int main(int argc, char **argv)
         exit(-1);
     }
 
+    else
+    {
+        // 初始化SSL连接，使用指定的证书和密钥文件
+        // - "cert.pem": 证书文件路径，用于验证身份
+        // - "key.pem": 私钥文件路径，用于加密通信
+        // - SSL_MODE_CLIENT: 设置SSL为客户端模式
+        // - clientfd: 客户端套接字文件描述符
+        ssl = sync_initialize_ssl("/home/ca-certificates/certs/ca.cert.pem","/root/ca-certificates/server-cert.pem", "/root/ca-certificates/server-private.key", SSL_MODE_CLIENT, clientfd);
+        if (nullptr == ssl)
+        {
+            cerr << "ssl initialize error" << endl;
+            close(clientfd);
+            exit(-1);
+        }
+    }
     // 初始化读写线程通信用的信号量
     sem_init(&rwsem, 0, 0);
     // 连接服务器成功，启动接收子线程
-    std::thread readTask(readTaskHandler, clientfd); // pthread_create
+    std::thread readTask(readTaskHandler, ssl); // pthread_create
     //将线程分离，分离后的线程会在后台独立运行
     //主线程接收用户输入并发送数据，子线程使其在后台持续运行从服务器接受数据，根据数据类型实现对应处理
     readTask.detach();                               // pthread_detach
@@ -126,15 +145,32 @@ int main(int argc, char **argv)
             js["msgid"] = LOGIN_MSG;
             js["id"] = id;
             js["password"] = pwd;
+            //string request = js.dump();
+
+            if (!SSL_is_init_finished(ssl)) {
+                cerr << "错误：SSL握手未完成，无法发送数据" << endl;
+                break;
+            }
+
             string request = js.dump();
+            int len = SSL_write(ssl, request.c_str(), request.size()); // 改用request.size()避免多余空字节
+            if (len <= 0) {
+                int error = SSL_get_error(ssl, len);
+                cerr << "SSL_write 失败，错误码：" << error << endl;
+                ERR_print_errors_fp(stderr); // 输出OpenSSL底层错误
+                continue;
+            }
 
             g_isLoginSuccess = false;
 
-            int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
-            if (len == -1)
-            {
-                cerr << "send login msg error:" << request << endl;
-            }
+            //int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
+            //int len = SSL_write(ssl, request.c_str(), strlen(request.c_str()) + 1);
+            // 关键：检查SSL握手是否完成
+            
+            // if (len == -1)
+            // {
+            //     cerr << "send login msg error:" << request << endl;
+            // }
 
             sem_wait(&rwsem); // 等待信号量，由子线程处理完登录的响应信息后，通知这里
 
@@ -142,7 +178,7 @@ int main(int argc, char **argv)
             {
                 // 进入聊天主菜单页面
                 isMainMenuRunning = true;
-                mainMenu(clientfd);
+                mainMenu(ssl);
             }
         }
         break;
@@ -161,7 +197,8 @@ int main(int argc, char **argv)
             js["password"] = pwd;
             string request = js.dump();
 
-            int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
+            //int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
+            int len = SSL_write(ssl, request.c_str(), strlen(request.c_str()) + 1);
             if (len == -1)
             {
                 cerr << "send reg msg error:" << request << endl;
@@ -174,6 +211,8 @@ int main(int argc, char **argv)
         case 3: // quit 业务
             //关闭客户端套接字clientfd,终止与服务器连接
             close(clientfd);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
             //销毁信号量rwsem，释放相关资源
             sem_destroy(&rwsem);
             //退出程序
@@ -294,18 +333,21 @@ void doLoginResponse(json &responsejs)
 
 // 子线程-接收线程
 //client客户端套接字描述符，用于与服务器进行通信
-void readTaskHandler(int clientfd)
+void readTaskHandler(SSL *ssl)
 {
     for (;;)
     {
         char buffer[1024] = {0};
         //recv函数用于接收服务器传输的数据
         //参数分别为客户端套接字 clientfd、存储数据缓冲区 buffer、缓冲区的最大长度 1024 以及标志位 0（表示使用默认行为）
-        int len = recv(clientfd, buffer, 1024, 0);
+        //int len = recv(clientfd, buffer, 1024, 0);
+        int len = SSL_read(ssl, buffer, 1024);
         //-1——接收数据错误， 0——对端已经关闭连接
         if (-1 == len || 0 == len)
         {
             close(clientfd);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
             exit(-1);
         }
 
@@ -386,19 +428,26 @@ string getCurrentTime()
 }
 
 //"help" command handler
-void help(int fd = 0, string str = "");
+//void help(int fd = 0, string str = "");
+void help(SSL *ssl = nullptr, string str = "");
 //"chat" command handler
-void chat(int, string);
+//void chat(int, string);
+void chat(SSL*, string);
 //"addfriend" command handler
-void addfriend(int, string);
+//void addfriend(int, string);
+void addfriend(SSL*, string);
 //"creategroup" command handler
-void creategroup(int, string);
+//void creategroup(int, string);
+void creategroup(SSL*, string);
 //"addgroup" command handler
-void addgroup(int, string);
+//void addgroup(int, string);
+void addgroup(SSL*, string);
 //"groupchat" command handler
-void groupchat(int, string);
+//void groupchat(int, string);
+void groupchat(SSL*, string);
 //"loginout" command handler
-void loginout(int, string);
+//void loginout(int, string);
+void loginout(SSL*, string);
 
 // 系统支持的客户端命令列表
 unordered_map<string, string> commandMap = {
@@ -411,7 +460,7 @@ unordered_map<string, string> commandMap = {
     {"loginout", "注销,格式loginout"}};
 
 // 注册系统支持的客户端命令处理
-unordered_map<string, function<void(int, string)>> commandHandlerMap = {
+unordered_map<string, function<void(SSL*, string)>> commandHandlerMap = {
     {"help", help},
     {"chat", chat},
     {"addfriend", addfriend},
@@ -421,7 +470,7 @@ unordered_map<string, function<void(int, string)>> commandHandlerMap = {
     {"loginout", loginout}};
 
 // 主聊天页面程序
-void mainMenu(int clientfd)
+void mainMenu(SSL *ssl)
 {
     help();
 
@@ -451,12 +500,12 @@ void mainMenu(int clientfd)
         }
 
         // 调用相应命令事件处理回调，mainMenu对修改封闭，添加新功能不需要修改该函数
-        it->second(clientfd, commandbuf.substr(idx + 1, commandbuf.size() - idx)); // 调用命令处理方法
+        it->second(ssl, commandbuf.substr(idx + 1, commandbuf.size() - idx)); // 调用命令处理方法
     }
 }
 
 //"help" command handler
-void help(int, string)
+void help(SSL*, string)
 {
     cout << "show commnand list >>>" << endl;
     for (auto &p : commandMap)
@@ -466,7 +515,7 @@ void help(int, string)
     cout << endl;
 }
 //"addfriend" command handler
-void addfriend(int clientfd, string str)
+void addfriend(SSL *ssl, string str)
 {
     int friendid = atoi(str.c_str());
     json js;
@@ -475,14 +524,15 @@ void addfriend(int clientfd, string str)
     js["friendid"] = friendid;
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = SSL_write(ssl, buffer.c_str(), strlen(buffer.c_str()) + 1);
+    //int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
     if (-1 == len)
     {
         cerr << "send addfriend msg error ->" << buffer << endl;
     }
 }
 //"chat" command handler
-void chat(int clientfd, string str)
+void chat(SSL *ssl, string str)
 {
     int idx = str.find(":"); // friendid:message
     if (-1 == idx)
@@ -503,14 +553,15 @@ void chat(int clientfd, string str)
     js["time"] = getCurrentTime();
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = SSL_write(ssl, buffer.c_str(), strlen(buffer.c_str()) + 1);
+    //int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
     if (-1 == len)
     {
         cerr << "send chat msg error ->" << buffer << endl;
     }
 }
 //"creategroup" command handler
-void creategroup(int clientfd, string str)
+void creategroup(SSL *ssl, string str)
 {
     int idx = str.find(":");
     if (-1 == idx)
@@ -530,14 +581,15 @@ void creategroup(int clientfd, string str)
 
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = SSL_write(ssl, buffer.c_str(), strlen(buffer.c_str()) + 1);
+    //int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
     if (-1 == len)
     {
         cerr << "send creategroup msg error ->" << buffer << endl;
     }
 }
 //"addgroup" command handler
-void addgroup(int clientfd, string str)
+void addgroup(SSL *ssl, string str)
 {
     int groupid = atoi(str.c_str());
     json js;
@@ -546,14 +598,15 @@ void addgroup(int clientfd, string str)
     js["groupid"] = groupid;
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = SSL_write(ssl, buffer.c_str(), strlen(buffer.c_str()) + 1);
+    //int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
     if (-1 == len)
     {
         cerr << "send addgroup msg error ->" << buffer << endl;
     }
 }
 //"groupchat" command handler groupid:message
-void groupchat(int clientfd, string str)
+void groupchat(SSL *ssl, string str)
 {
     int idx = str.find(":");
     if (-1 == idx)
@@ -574,14 +627,16 @@ void groupchat(int clientfd, string str)
     js["time"] = getCurrentTime();
 
     string buffer = js.dump();
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+
+    int len = SSL_write(ssl, buffer.c_str(), strlen(buffer.c_str()) + 1);
+    //int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
     if (-1 == len)
     {
         cerr << "send groupchat msg error ->" << buffer << endl;
     }
 }
 //"loginout" command handler
-void loginout(int clientfd, string str)
+void loginout(SSL *ssl, string str)
 {
 
     json js;
@@ -589,7 +644,8 @@ void loginout(int clientfd, string str)
     js["id"] = g_currentUser.getId();
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = SSL_write(ssl, buffer.c_str(), strlen(buffer.c_str()) + 1);
+    //int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
     if (-1 == len)
     {
         cerr << "send loginout msg error ->" << buffer << endl;

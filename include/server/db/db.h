@@ -1,15 +1,13 @@
 #ifndef DB_H
 #define DB_H
-
 #include <mysql/mysql.h>
 #include <string>
+#include "sqlconnRAII.h"
+#include "sqlconnpool.h"
 using namespace std;
-
-
 
 class MySQL
 {
-
 public:
     // 初始化数据库连接
     MySQL();
@@ -18,7 +16,7 @@ public:
     ~MySQL();
 
     // 连接数据库
-    bool connect();
+    bool connect(MYSQL*m_sql);
    
     // 更新操作
     bool update(string sql);

@@ -12,6 +12,8 @@
 #include "offlinemessagemodel.hpp"
 #include "json.hpp"
 #include "friendmodel.hpp"
+//#include "SSLConnection.h"
+#include "PlaintextConnection.h"
 #include <mutex>
 using namespace std;
 using namespace muduo;

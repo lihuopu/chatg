@@ -2,10 +2,11 @@
 #include <muduo/base/Logging.h>
 #include <string>
 #include <vector>
-
+#include <iostream>
 #include "public.hpp"
-using namespace muduo;
 using namespace std;
+using namespace muduo;
+
 
 // 获取单例对象的接口函数——对应单例模式，一个类只有对象，类内创建，外部调用
 ChatService *ChatService::instance()
@@ -43,6 +44,10 @@ void ChatService::reset()
 {
    // 把Online状态的用户，设置成offline
    _userModel.resetState();
+
+   for (auto it = _userConnMap.begin(); it != _userConnMap.end(); ++it){
+      _redis.del_user(it->first);
+  }
 }
 
 // 获取消息对应的处理器
@@ -70,7 +75,6 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
 {
    int id = js["id"].get<int>();
    string pwd = js["password"];
-
    User user = _userModel.query(id);
    if (user.getId() == id && user.getPwd() == pwd)
    {
@@ -83,6 +87,8 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
          response["errno"] = 2;
          response["errmsg"] = "this account is using ,input another";
          conn->send(response.dump());
+         // string response_str = response.dump();
+         // conn->sendData(response_str.c_str(), response_str.size());
       }
       else
       {
@@ -99,6 +105,16 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
          // 登录成功，更新用户状态信息 state offline = >online
          user.setState("online");
          _userModel.updateState(user);
+
+         string value = _redis.get_state(id);
+         if (value == "null"){
+                _redis.add_user(id);
+         }
+         else if(value == "offline"){
+                _redis.set_state(id,"online");
+         }
+
+
 
          json response;
          response["msgid"] = LOGIN_MSG_ACK;
@@ -161,6 +177,9 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
             response["groups"] = groupV;
          }
          conn->send(response.dump());
+         // string response_str = response.dump();
+         // conn->sendData(response_str.c_str(), response_str.size());
+         //conn->get_conn()->send(response_str);
       }
    }
    else
@@ -172,10 +191,12 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
       response["errmsg"] = "id or password is invalid!";
 
       conn->send(response.dump());
+      // string response_str = response.dump();
+      // conn->sendData(response_str.c_str(), response_str.size());
    }
 }
 
-// 处理注册业务 name password
+//处理注册业务 name password
 void ChatService::reg(const TcpConnectionPtr &conn, json &js, Timestamp time)
 {
    string name = js["name"];
@@ -194,6 +215,9 @@ void ChatService::reg(const TcpConnectionPtr &conn, json &js, Timestamp time)
       response["errno"] = 0; // 修改
       response["id"] = user.getId();
       conn->send(response.dump());
+      //string response_str = response.dump();
+      //conn->SSLSendData(response_str.c_str(), response_str.size());
+     // conn->get_conn()->send(response_str);
    }
    else
    {
@@ -204,8 +228,53 @@ void ChatService::reg(const TcpConnectionPtr &conn, json &js, Timestamp time)
       // response["errmsg"] = 1;
       response["id"] = user.getId();
       conn->send(response.dump());
+      // string response_str = response.dump();
+      // conn->SSLSendData(response_str.c_str(), response_str.size());
    }
 }
+// void ChatService::reg(const PlaintextConnectionPtr &conn, json &js, Timestamp time)
+// {
+//     string name = js["name"];
+//     string pwd = js["password"];
+
+//     User user;
+//     user.setName(name);
+//     user.setPwd(pwd);
+//     bool state = _userModel.insert(user);
+
+//     json response;
+//     response["msgid"] = REG_MSG_ACK;
+//    //  response["errno"] = state ? 0 : 1;
+//    //  response["id"] = user.getId();
+//    if (state) {
+//          // 注册成功
+//          response["errno"] = 0;
+//          response["id"] = user.getId();
+//          LOG_INFO << "发送注册响应: " << response.dump();
+//    } else {
+//          // 注册失败，获取具体错误信息
+//          response["errno"] = 1;
+//          response["id"] = 0;
+//          response["errmsg"] = "注册失败，用户名可能已存在";
+//          LOG_WARN << "注册失败: " << response.dump();
+//    }
+
+//     string response_str = response.dump();
+
+//     //LOG_INFO << "发送注册响应: " << response_str;  // 添加日志确认
+    
+//     // 统一使用明文发送（移除所有SSLSendData调用）
+//     //conn->get_conn()->send(response_str);
+//     //conn->sendData(response_str.c_str(), response_str.size());
+//       // 发送响应前检查连接状态
+//       if (conn->isConnected()) {
+//          conn->sendData(response_str.c_str(), response_str.size());
+//          LOG_INFO << "Sent plaintext data, size: " << response_str.size();
+//      } else {
+//          LOG_WARN << "Connection closed, cannot send registration response";
+//          return;
+//      }
+// }
 
 // 处理注销业务
 void ChatService::loginout(const TcpConnectionPtr &conn, json &js, Timestamp)
@@ -228,6 +297,7 @@ void ChatService::loginout(const TcpConnectionPtr &conn, json &js, Timestamp)
 
    User user(userid, "", "", "offline");
    _userModel.updateState(user);
+   _redis.del_user(userid);
 }
 // 处理客户端异常退出
 void ChatService::clientCloseException(const TcpConnectionPtr &conn)
@@ -256,8 +326,10 @@ void ChatService::clientCloseException(const TcpConnectionPtr &conn)
    {
       user.setState("offline");
       _userModel.updateState(user);
+      _redis.del_user(user.getId());
    }
 }
+
 // 一对一聊天
 void ChatService::oneChat(const TcpConnectionPtr &conn, json &js, Timestamp)
 {
@@ -270,14 +342,33 @@ void ChatService::oneChat(const TcpConnectionPtr &conn, json &js, Timestamp)
       {
          // toid在线，转发信息 服务器主动推送消息给toid用户
          it->second->send(js.dump());
+         // string response_str = js.dump();
+         // it->second->sendData(response_str.c_str(), response_str.size());
          return;
       }
    }
 
-   // 查询toid是否在线
+   // 查询toid是否在线  online --说明接收方可能在其他服务器节点在线，或内存连接池未及时更新，通过 Redis 发布消息（适用于分布式场景）
+   /*
+
+   */
+  string value = _redis.get_state(toid);
+    if(value != "null"){
+        if(value == "online"){
+            std::cout<<"user "<<toid<<" is online in redis"<<std::endl;
+            _redis.publish(toid, js.dump());
+        }
+        else{
+            std::cout<<"user "<<toid<<" is offline in redis"<<std::endl;
+            _offlineMsgModel.insert(toid, js.dump());
+        }
+        return;
+    }
+
    User user = _userModel.query(toid);
    if (user.getState() == "online")
-   {
+   {  
+      _redis.set_state(toid,"online");
       _redis.publish(toid, js.dump());
       return;
    }
@@ -285,6 +376,7 @@ void ChatService::oneChat(const TcpConnectionPtr &conn, json &js, Timestamp)
    // toid不在线，存储离线消息
 
    _offlineMsgModel.insert(toid, js.dump());
+   _redis.set_state(toid,"offline");
 }
 
 // 添加好友业务 msgid id  friendid
@@ -310,6 +402,7 @@ void ChatService::createGroup(const TcpConnectionPtr &conn, json &js, Timestamp)
    {
       // 存储群组创建人信息
       _groupModel.addGroup(userid, group.getId(), "creator");
+      printf("your groupid is %d",group.getId());
    }
 }
 
@@ -336,18 +429,32 @@ void ChatService::groupChat(const TcpConnectionPtr &conn, json &js, Timestamp)
       {
          // 转发群消息
          it->second->send(js.dump());
+         // string response_str = js.dump();
+         // it->second->sendData(response_str.c_str(), response_str.size());
       }
       else
       {
          // 查询toid是否在线
+         string value = _redis.get_state(id);
+            if(value != "null"){
+                if(value == "online"){
+                    _redis.publish(id, js.dump());
+                }
+                else{
+                _offlineMsgModel.insert(id, js.dump());
+                }
+                return;
+         }
          User user = _userModel.query(id);
          if (user.getState() == "online")
          {
+            _redis.set_state(id,"online");
             _redis.publish(id, js.dump());
          }
          else
          {
             // 存储离线群消息
+            _redis.set_state(id,"offline");
             _offlineMsgModel.insert(id, js.dump());
          }
       }
@@ -365,6 +472,7 @@ void ChatService::handleRedisSubscribeMessage(int userid, string msg)
    {
       //将数据发送给对端，即客户端
       it->second->send(msg);
+      //it->second->sendData(msg.c_str(), msg.size());
       return;
    }
 
